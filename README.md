@@ -9,10 +9,10 @@ and bidi RPCs that fetch cannot.
 | | |
 |---|---|
 | [`rust/`](rust/) | crate `connectrpc-webtransport` — server bridge for any `tower::Service` and a `connectrpc` `ClientTransport` |
-| [`ts/`](ts/) | JSR `@sachaw/connectrpc-webtransport` — a `@connectrpc/connect` `Transport` |
+| [`ts/`](ts/) | JSR `@sachaw/connectrpc-webtransport` — a `@connectrpc/connect` `Transport`, and a server for Deno |
 | [`PROTOCOL.md`](PROTOCOL.md) | the wire format |
 
-`cargo test` in `rust/` also runs the TypeScript transport against the Rust
-server over real QUIC (needs Deno).
+`cargo test` in `rust/` also runs each client against the other side's server
+over real QUIC (needs Deno).
 
 MPL-2.0.

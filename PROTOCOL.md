@@ -26,7 +26,7 @@ content-type: application/proto
   still works.
 - **Response body**: `content-length` or `transfer-encoding: chunked`; a
   response also ends at FIN.
-- `Host` is not required. Heads are bounded (400 KiB server, 1 MiB client)
+- `Host` is not required. Heads are bounded (400 KiB in Rust, 1 MiB in TypeScript)
   and the server times out a head not received within 30 s.
 
 The server may stop reading the request stream (`STOP_SENDING`) once it has

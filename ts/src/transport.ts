@@ -27,6 +27,13 @@ import {
   trailerDemux,
   validateResponse,
 } from "@connectrpc/connect/protocol-connect";
+import {
+  encodeChunk,
+  encodeHead,
+  type Head,
+  Http1Reader,
+  LAST_CHUNK,
+} from "./http1.ts";
 import type {
   BinaryReadOptions,
   BinaryWriteOptions,
@@ -63,7 +70,6 @@ export interface WebTransportTransportOptions {
 }
 
 const MAX_BYTES = 0xffffffff;
-const MAX_HEAD_BYTES = 1 << 20;
 
 export function createWebTransportTransport(
   options: WebTransportTransportOptions,
@@ -287,11 +293,6 @@ interface Call {
   >;
 }
 
-const encoder = new TextEncoder();
-const decoder = new TextDecoder();
-const CRLF = encoder.encode("\r\n");
-const LAST_CHUNK = encoder.encode("0\r\n\r\n");
-
 // A known-length request carries content-length; otherwise it is chunked, so its end never depends on the stream's FIN (Deno never sends one).
 async function open(
   session: WebTransport,
@@ -304,7 +305,7 @@ async function open(
     throw ConnectError.from(e, Code.Unavailable);
   });
   const writer = stream.writable.getWriter();
-  const reader = stream.readable.getReader();
+  const reader = new Http1Reader(stream.readable.getReader());
   let aborted: unknown;
   const abort = (reason: unknown) => {
     aborted = reason;
@@ -318,78 +319,15 @@ async function open(
   header.delete("transfer-encoding");
   if (chunked) header.set("transfer-encoding", "chunked");
   else header.set("content-length", String(contentLength));
-  let head = `POST ${path} HTTP/1.1\r\n`;
-  for (const [name, value] of header) head += `${name}: ${value}\r\n`;
-  await writer.write(encoder.encode(head + "\r\n"));
-
-  let buffered: Uint8Array = new Uint8Array(0);
-  const fill = async (): Promise<boolean> => {
-    const { value, done } = await reader.read();
-    if (done) return false;
-    buffered = concat(buffered, value);
-    return true;
-  };
-  async function* rest(limit: number): AsyncIterable<Uint8Array> {
-    while (limit > 0) {
-      if (buffered.byteLength === 0 && !(await fill())) {
-        if (aborted !== undefined) throw aborted;
-        if (limit === Infinity) return;
-        throw new ConnectError(
-          "stream ended inside the response body",
-          Code.Unavailable,
-        );
-      }
-      const chunk = buffered.subarray(0, Math.min(buffered.byteLength, limit));
-      buffered = buffered.subarray(chunk.byteLength);
-      limit -= chunk.byteLength;
-      if (chunk.byteLength > 0) yield chunk;
-    }
-  }
-  const line = async (): Promise<string> => {
-    let i: number;
-    while ((i = buffered.indexOf(10)) < 0) {
-      if (!(await fill())) {
-        throw aborted ??
-          new ConnectError(
-            "stream ended inside a chunked body",
-            Code.Unavailable,
-          );
-      }
-    }
-    const text = decoder.decode(buffered.subarray(0, i)).trim();
-    buffered = buffered.subarray(i + 1);
-    return text;
-  };
-  // RFC 9112 §7.1; trailers are dropped (Connect does not use them).
-  async function* dechunked(): AsyncIterable<Uint8Array> {
-    for (;;) {
-      const size = parseInt(await line(), 16);
-      if (!Number.isInteger(size)) {
-        throw new ConnectError("invalid chunk size", Code.Internal);
-      }
-      if (size === 0) break;
-      yield* rest(size);
-      await line();
-    }
-    while ((await line()) !== "");
-  }
+  await writer.write(encodeHead(`POST ${path} HTTP/1.1`, header));
 
   return {
     async send(body) {
       try {
         for await (const chunk of body) {
           if (chunk.byteLength === 0) continue;
-          const frame = chunked
-            ? concat(
-              concat(
-                encoder.encode(`${chunk.byteLength.toString(16)}\r\n`),
-                chunk,
-              ),
-              CRLF,
-            )
-            : chunk;
           try {
-            await writer.write(frame);
+            await writer.write(chunked ? encodeChunk(chunk) : chunk);
           } catch {
             return;
           }
@@ -402,66 +340,43 @@ async function open(
       }
     },
     async response() {
-      let end = -1;
-      while ((end = indexOfHeadEnd(buffered)) < 0) {
-        if (buffered.byteLength > MAX_HEAD_BYTES) {
-          throw new ConnectError(
-            "response head exceeds the size limit",
-            Code.ResourceExhausted,
-          );
-        }
-        if (!(await fill())) {
-          throw aborted ??
-            new ConnectError(
-              "stream closed before the response head",
-              Code.Unavailable,
-            );
-        }
+      let head: Head | null;
+      try {
+        head = await reader.head();
+      } catch (e) {
+        throw aborted ?? e;
       }
-      const [statusLine, ...lines] = decoder.decode(buffered.subarray(0, end))
-        .split("\r\n");
-      buffered = buffered.subarray(end + 4);
-      const status = Number(statusLine.split(" ")[1]);
-      if (!statusLine.startsWith("HTTP/1.1 ") || !Number.isInteger(status)) {
+      if (head === null) {
+        throw aborted ??
+          new ConnectError(
+            "stream closed before the response head",
+            Code.Unavailable,
+          );
+      }
+      const status = Number(head.startLine.split(" ")[1]);
+      if (
+        !head.startLine.startsWith("HTTP/1.1 ") || !Number.isInteger(status)
+      ) {
         throw new ConnectError(
-          `invalid status line: ${statusLine}`,
+          `invalid status line: ${head.startLine}`,
           Code.Internal,
         );
       }
-      const header = new Headers();
-      for (const line of lines) {
-        const colon = line.indexOf(":");
-        header.append(
-          line.slice(0, colon).trim(),
-          line.slice(colon + 1).trim(),
-        );
-      }
-      const chunked =
-        header.get("transfer-encoding")?.toLowerCase() === "chunked";
-      const length = header.get("content-length");
-      const body = chunked
-        ? dechunked()
-        : rest(length === null ? Infinity : Number(length));
-      return { status, header, body };
+      const body = reader.body(head.headers, "response");
+      return {
+        status,
+        header: head.headers,
+        body: (async function* () {
+          try {
+            yield* body;
+          } catch (e) {
+            throw aborted ?? e;
+          }
+          if (aborted !== undefined) throw aborted;
+        })(),
+      };
     },
   };
-}
-
-function indexOfHeadEnd(buf: Uint8Array): number {
-  for (let i = 0; i + 3 < buf.byteLength; i++) {
-    if (
-      buf[i] === 13 && buf[i + 1] === 10 && buf[i + 2] === 13 &&
-      buf[i + 3] === 10
-    ) return i;
-  }
-  return -1;
-}
-
-function concat(a: Uint8Array, b: Uint8Array): Uint8Array {
-  const out = new Uint8Array(a.byteLength + b.byteLength);
-  out.set(a);
-  out.set(b, a.byteLength);
-  return out;
 }
 
 function reconnecting(

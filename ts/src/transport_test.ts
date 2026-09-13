@@ -1,91 +1,40 @@
 import { assertEquals, assertRejects } from "@std/assert";
 import { Code, ConnectError, createClient } from "@connectrpc/connect";
-import { create, toBinary } from "@bufbuild/protobuf";
-import { createWebTransportTransport, type LinkState } from "./mod.ts";
-import { EchoSchema, EchoService } from "../testing/echo_pb.ts";
 import {
-  collect,
-  envelope,
-  envelopes,
-  fakeSession,
-  type Handler,
-} from "../testing/fake.ts";
+  createWebTransportServer,
+  createWebTransportTransport,
+  type LinkState,
+} from "./mod.ts";
+import type { Echo } from "../testing/echo_pb.ts";
+import { echo, EchoService, seen } from "../testing/echo_service.ts";
+import { memorySessionPair } from "../testing/memory.ts";
 
-const END = 0b10;
-const encode = (text: string) =>
-  toBinary(EchoSchema, create(EchoSchema, { text }));
+const serve = createWebTransportServer({
+  routes: (r) => r.service(EchoService, echo),
+});
 
-const echo: Handler = async (req) => {
-  switch (req.path) {
-    case "/echo.EchoService/Unary":
-      return {
-        status: 200,
-        headers: req.headers,
-        body: [await collect(req.body)],
-      };
-    case "/echo.EchoService/Fail":
-      return {
-        status: 404,
-        headers: { "content-type": "application/json" },
-        body: [
-          new TextEncoder().encode(
-            '{"code":"not_found","message":"no such thing"}',
-          ),
-        ],
-      };
-    case "/echo.EchoService/ServerStream": {
-      const [message] = await Array.fromAsync(envelopes(req.body));
-      return {
-        status: 200,
-        headers: { "content-type": req.headers.get("content-type")! },
-        body: [
-          envelope(0, message),
-          envelope(0, message),
-          envelope(0, message),
-          envelope(END, '{"metadata":{"x-trailer":["yes"]}}'),
-        ],
-      };
-    }
-    case "/echo.EchoService/Bidi":
-      return {
-        status: 200,
-        headers: { "content-type": req.headers.get("content-type")! },
-        body: (async function* () {
-          for await (const message of envelopes(req.body)) {
-            yield envelope(0, message);
-          }
-          yield envelope(END, "{}");
-        })(),
-      };
-    default:
-      throw new Error(`unexpected path ${req.path}`);
-  }
-};
+function session(): WebTransport {
+  const pair = memorySessionPair();
+  void serve(pair.server);
+  return pair.client;
+}
 
 Deno.test("unary declares content-length and speaks Connect", async () => {
-  let seen: Headers | undefined;
-  let seenMethod: string | undefined;
-  const session = fakeSession((req) => {
-    seen = req.headers;
-    seenMethod = req.method;
-    return echo(req);
-  });
   const client = createClient(
     EchoService,
-    createWebTransportTransport({ session }),
+    createWebTransportTransport({ session: session() }),
   );
-  const res = await client.unary({ text: "hi" });
-  assertEquals(res.text, "hi");
-  assertEquals(seenMethod, "POST");
-  assertEquals(seen!.get("content-type"), "application/proto");
-  assertEquals(seen!.get("connect-protocol-version"), "1");
-  assertEquals(seen!.get("content-length"), String(encode("hi").byteLength));
+  assertEquals((await client.unary({ text: "hi" })).text, "hi");
+  assertEquals(seen!.requestMethod, "POST");
+  assertEquals(seen!.requestHeader.get("content-type"), "application/proto");
+  assertEquals(seen!.requestHeader.get("connect-protocol-version"), "1");
+  assertEquals(seen!.requestHeader.get("content-length"), "4");
 });
 
 Deno.test("unary error carries the Connect code", async () => {
   const client = createClient(
     EchoService,
-    createWebTransportTransport({ session: fakeSession(echo) }),
+    createWebTransportTransport({ session: session() }),
   );
   const err = await assertRejects(
     () => client.fail({ text: "x" }),
@@ -95,13 +44,23 @@ Deno.test("unary error carries the Connect code", async () => {
   assertEquals(err.rawMessage, "no such thing");
 });
 
+Deno.test("an unknown path is Unimplemented", async () => {
+  const empty = createWebTransportServer({ routes: () => {} });
+  const pair = memorySessionPair();
+  void empty(pair.server);
+  const client = createClient(
+    EchoService,
+    createWebTransportTransport({ session: pair.client }),
+  );
+  const err = await assertRejects(
+    () => client.unary({ text: "x" }),
+    ConnectError,
+  );
+  assertEquals(err.code, Code.Unimplemented);
+});
+
 Deno.test("server stream declares content-length and yields trailers", async () => {
-  let seen: Headers | undefined;
-  const session = fakeSession((req) => {
-    seen = req.headers;
-    return echo(req);
-  });
-  const transport = createWebTransportTransport({ session });
+  const transport = createWebTransportTransport({ session: session() });
   const res = await transport.stream(
     EchoService.method.serverStream,
     undefined,
@@ -111,24 +70,19 @@ Deno.test("server stream declares content-length and yields trailers", async () 
       yield { text: "s" };
     })(),
   );
-  const texts = (await Array.fromAsync(res.message)).map((m) => m.text);
-  assertEquals(texts, ["s", "s", "s"]);
-  assertEquals(res.trailer.get("x-trailer"), "yes");
-  assertEquals(
-    seen!.get("content-length"),
-    String(envelope(0, encode("s")).byteLength),
-  );
+  assertEquals((await Array.fromAsync(res.message)).map((m) => m.text), [
+    "s",
+    "s",
+    "s",
+  ]);
+  assertEquals(res.trailer.get("x-echo-trailer"), "yes");
+  assertEquals(seen!.requestHeader.get("content-length"), "8");
 });
 
 Deno.test("bidi streams both ways as a chunked request", async () => {
-  let seen: Headers | undefined;
-  const session = fakeSession((req) => {
-    seen = req.headers;
-    return echo(req);
-  });
   const client = createClient(
     EchoService,
-    createWebTransportTransport({ session }),
+    createWebTransportTransport({ session: session() }),
   );
   const texts: string[] = [];
   for await (
@@ -138,21 +92,20 @@ Deno.test("bidi streams both ways as a chunked request", async () => {
     })())
   ) texts.push(m.text);
   assertEquals(texts, ["a", "b"]);
-  assertEquals(seen!.has("content-length"), false);
-  assertEquals(seen!.get("transfer-encoding"), "chunked");
+  assertEquals(seen!.requestHeader.has("content-length"), false);
+  assertEquals(seen!.requestHeader.get("transfer-encoding"), "chunked");
 });
 
 Deno.test("a failing bidi input surfaces on the call, not as an unhandled rejection", async () => {
   const client = createClient(
     EchoService,
-    createWebTransportTransport({ session: fakeSession(echo) }),
+    createWebTransportTransport({ session: session() }),
   );
-  const boom = new Error("input broke");
   const err = await assertRejects(async () => {
     for await (
       const _ of client.bidi((async function* () {
         yield { text: "a" };
-        throw boom;
+        throw new Error("input broke");
       })())
     ) { /* drain */ }
   }, ConnectError);
@@ -175,10 +128,15 @@ Deno.test("a session that cannot open is Unavailable", async () => {
 });
 
 Deno.test("deadline aborts a call the server never answers", async () => {
-  const session = fakeSession(() => new Promise(() => {}));
+  const stuck = createWebTransportServer({
+    routes: (router) =>
+      router.service(EchoService, { unary: () => new Promise<Echo>(() => {}) }),
+  });
+  const pair = memorySessionPair();
+  void stuck(pair.server);
   const client = createClient(
     EchoService,
-    createWebTransportTransport({ session }),
+    createWebTransportTransport({ session: pair.client }),
   );
   const err = await assertRejects(
     () => client.unary({ text: "x" }, { timeoutMs: 20 }),
@@ -190,12 +148,13 @@ Deno.test("deadline aborts a call the server never answers", async () => {
 Deno.test("factory sessions open lazily, share one dial, back off, and reconnect", async () => {
   const states: LinkState[] = [];
   let opens = 0;
-  let session = fakeSession(echo);
+  let pair = memorySessionPair();
+  void serve(pair.server);
   const transport = createWebTransportTransport({
     session: () => {
       opens += 1;
       if (opens < 3) return Promise.reject(new Error("refused"));
-      return Promise.resolve(session);
+      return Promise.resolve(pair.client);
     },
     backoff: { initialMs: 1, maxMs: 2 },
     onState: (s) => states.push(s),
@@ -217,9 +176,10 @@ Deno.test("factory sessions open lazily, share one dial, back off, and reconnect
     ["connected", 0],
   ]);
 
-  session.closeNow();
-  await session.closed;
-  session = fakeSession(echo);
+  pair.client.close();
+  await pair.client.closed;
+  pair = memorySessionPair();
+  void serve(pair.server);
   assertEquals((await client.unary({ text: "5" })).text, "5");
   assertEquals(opens, 4);
   assertEquals(states.slice(3).map((s) => s.phase), [

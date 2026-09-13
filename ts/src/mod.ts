@@ -24,3 +24,8 @@ export type {
   LinkState,
   WebTransportTransportOptions,
 } from "./transport.ts";
+export { createWebTransportServer } from "./server.ts";
+export type {
+  WebTransportServer,
+  WebTransportServerOptions,
+} from "./server.ts";

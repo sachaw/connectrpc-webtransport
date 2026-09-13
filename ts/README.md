@@ -28,7 +28,29 @@ Options mirror `createConnectTransport` (`useBinaryFormat`, `interceptors`,
 `jsonOptions`, `binaryOptions`, `readMaxBytes`, `writeMaxBytes`,
 `defaultTimeoutMs`). `useBinaryFormat` defaults to `true` here.
 
-The server is the
+## Server
+
+```ts
+import { createWebTransportServer } from "@sachaw/connectrpc-webtransport";
+
+const serve = createWebTransportServer({
+  routes: (router) => router.service(MyService, impl),
+});
+
+const listener = new Deno.QuicEndpoint({ port: 4433 }).listen({
+  cert,
+  key,
+  alpnProtocols: ["h3"],
+});
+for await (const incoming of listener) {
+  void Deno.upgradeWebTransport(await incoming.accept()).then(serve);
+}
+```
+
+`routes` and the remaining options are those of Connect's `createConnectRouter`.
+The server takes accepted sessions; listening and TLS are the runtime's.
+
+The Rust counterpart is the
 [`connectrpc-webtransport`](https://crates.io/crates/connectrpc-webtransport)
 crate; the wire format is in
 [`PROTOCOL.md`](https://github.com/sachaw/connectrpc-webtransport/blob/master/PROTOCOL.md).

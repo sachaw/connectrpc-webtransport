@@ -1,46 +1,57 @@
-//! Runs the TypeScript transport (Deno) against this server over real QUIC.
+//! Runs the TypeScript client against this server and this client against the TypeScript server, over real QUIC.
 //! Skipped when `deno` is not installed.
 
-#![cfg(feature = "server")]
+#![cfg(all(feature = "server", feature = "client"))]
 
 use std::convert::Infallible;
 use std::process::Stdio;
+use std::time::Duration;
 
 use bytes::{Buf, Bytes, BytesMut};
+use connectrpc::client::{ClientBody, ClientTransport};
 use futures_util::stream;
 use http::header::CONTENT_TYPE;
 use http::{Request, Response};
 use http_body::Frame;
-use http_body_util::{BodyExt, StreamBody};
+use http_body_util::{BodyExt, Full, StreamBody};
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tower::service_fn;
 use wtransport::tls::Sha256DigestFmt;
-use wtransport::{Endpoint, Identity, ServerConfig};
+use wtransport::{ClientConfig, Endpoint, Identity, ServerConfig};
 
-use connectrpc_webtransport::Body;
+use connectrpc_webtransport::{Body, client};
 
 const END_STREAM: u8 = 0b10;
+const TS_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../ts");
 
-#[tokio::test]
-async fn typescript_transport_conforms() {
-    if tokio::process::Command::new("deno")
+async fn deno_available() -> bool {
+    tokio::process::Command::new("deno")
         .arg("--version")
         .stdout(Stdio::null())
         .status()
         .await
-        .is_err()
-    {
-        eprintln!("skipping: deno not found");
-        return;
-    }
+        .is_ok()
+}
 
-    let identity = Identity::self_signed_builder()
+fn identity() -> Identity {
+    Identity::self_signed_builder()
         .subject_alt_names(["localhost", "127.0.0.1"])
         .from_now_utc()
         .validity_days(14)
         .build()
-        .unwrap();
+        .unwrap()
+}
+
+#[tokio::test]
+async fn typescript_client_conforms() {
+    if !deno_available().await {
+        eprintln!("skipping: deno not found");
+        return;
+    }
+
+    let identity = identity();
     let hash = identity.certificate_chain().as_slice()[0]
         .hash()
         .fmt(Sha256DigestFmt::DottedHex);
@@ -164,6 +175,166 @@ fn drain_envelopes(buf: &mut BytesMut) -> Vec<Bytes> {
         }
         buf.advance(5);
         out.push(buf.split_to(len).freeze());
+    }
+    out
+}
+
+fn proto_text(text: &str) -> Vec<u8> {
+    let mut out = vec![0x0a, text.len() as u8];
+    out.extend_from_slice(text.as_bytes());
+    out
+}
+
+fn request(path: &str, content_type: &str, body: ClientBody) -> http::Request<ClientBody> {
+    http::Request::post(format!("https://127.0.0.1{path}"))
+        .header("content-type", content_type)
+        .body(body)
+        .unwrap()
+}
+
+fn client_body(bytes: impl Into<Bytes>) -> ClientBody {
+    Full::new(bytes.into())
+        .map_err(|e: Infallible| match e {})
+        .boxed()
+}
+
+#[tokio::test]
+async fn typescript_server_conforms() {
+    if !deno_available().await {
+        eprintln!("skipping: deno not found");
+        return;
+    }
+
+    let identity = identity();
+    let leaf = &identity.certificate_chain().as_slice()[0];
+    let mut server = tokio::process::Command::new("deno")
+        .args([
+            "run",
+            "--allow-net",
+            "--allow-env=ECHO_CERT,ECHO_KEY",
+            "testing/serve.ts",
+        ])
+        .current_dir(TS_DIR)
+        .env("ECHO_CERT", leaf.to_pem())
+        .env("ECHO_KEY", identity.private_key().to_secret_pem())
+        .stdout(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut port = String::new();
+    BufReader::new(server.stdout.take().unwrap())
+        .read_line(&mut port)
+        .await
+        .unwrap();
+    let port: u16 = port
+        .trim()
+        .parse()
+        .expect("deno server must print its port");
+
+    let transport = client::connect(
+        &format!("https://127.0.0.1:{port}/echo"),
+        ClientConfig::builder()
+            .with_bind_default()
+            .with_server_certificate_hashes([leaf.hash()])
+            .build(),
+    )
+    .await
+    .unwrap();
+
+    let response = transport
+        .send(request(
+            "/echo.EchoService/Unary",
+            "application/proto",
+            client_body(proto_text("hello")),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.into_body().collect().await.unwrap().to_bytes(),
+        proto_text("hello")
+    );
+
+    let response = transport
+        .send(request(
+            "/echo.EchoService/Fail",
+            "application/proto",
+            client_body(proto_text("x")),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 404);
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    assert!(
+        body.starts_with(br#"{"code":"not_found""#),
+        "{}",
+        String::from_utf8_lossy(&body)
+    );
+
+    let message = proto_text("s");
+    let response = transport
+        .send(request(
+            "/echo.EchoService/ServerStream",
+            "application/connect+proto",
+            client_body(envelope(0, &message)),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let mut body = BytesMut::from(response.into_body().collect().await.unwrap().to_bytes());
+    let frames = drain_frames(&mut body);
+    assert_eq!(frames.len(), 4);
+    assert!(frames[..3].iter().all(|(f, m)| *f == 0 && m == &message));
+    assert_eq!(frames[3].0, END_STREAM);
+    assert!(
+        std::str::from_utf8(&frames[3].1)
+            .unwrap()
+            .contains("x-echo-trailer")
+    );
+
+    let (tx, rx) = mpsc::channel::<Result<Frame<Bytes>, Infallible>>(4);
+    let body: ClientBody = StreamBody::new(stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|f| (f, rx))
+    }))
+    .map_err(|e: Infallible| match e {})
+    .boxed();
+    tx.send(Ok(Frame::data(envelope(0, &proto_text("a")))))
+        .await
+        .unwrap();
+    let mut response = transport
+        .send(request(
+            "/echo.EchoService/Bidi",
+            "application/connect+proto",
+            body,
+        ))
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(3), response.body_mut().frame())
+        .await
+        .expect("echo must arrive while the request is still open")
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.into_data().unwrap(), envelope(0, &proto_text("a")));
+    tx.send(Ok(Frame::data(envelope(0, &proto_text("b")))))
+        .await
+        .unwrap();
+    drop(tx);
+    let mut rest = BytesMut::from(response.into_body().collect().await.unwrap().to_bytes());
+    let frames = drain_frames(&mut rest);
+    assert_eq!(frames[0], (0, Bytes::from(proto_text("b"))));
+    assert_eq!(frames.last().unwrap().0, END_STREAM);
+}
+
+fn drain_frames(buf: &mut BytesMut) -> Vec<(u8, Bytes)> {
+    let mut out = Vec::new();
+    while buf.len() >= 5 {
+        let flags = buf[0];
+        let len = u32::from_be_bytes(buf[1..5].try_into().unwrap()) as usize;
+        if buf.len() < 5 + len {
+            break;
+        }
+        buf.advance(5);
+        out.push((flags, buf.split_to(len).freeze()));
     }
     out
 }
