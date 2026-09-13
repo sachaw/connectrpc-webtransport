@@ -1,0 +1,68 @@
+name: ci
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: rust
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: denoland/setup-deno@v2
+      - uses: taiki-e/install-action@cargo-hack
+      - run: cargo fmt --check
+      - run: cargo hack --each-feature clippy --all-targets -- -D warnings
+      - run: cargo test --all-features
+
+  ts:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ts
+    steps:
+      - uses: actions/checkout@v7
+      - uses: denoland/setup-deno@v2
+      - run: deno task check
+      - run: deno task test
+      - run: deno publish --dry-run
+
+  crate:
+    if: github.ref == 'refs/heads/master'
+    needs: rust
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - id: auth
+        uses: rust-lang/crates-io-auth-action@v1
+      - uses: katyo/publish-crates@v2
+        with:
+          path: rust
+          registry-token: ${{ steps.auth.outputs.token }}
+
+  jsr:
+    if: github.ref == 'refs/heads/master'
+    needs: ts
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+      - uses: denoland/setup-deno@v2
+      - run: deno publish
+        working-directory: ts
