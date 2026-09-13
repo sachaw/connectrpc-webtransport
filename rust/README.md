@@ -1,5 +1,7 @@
 # connectrpc-webtransport
 
+[![crates.io](https://img.shields.io/crates/v/connectrpc-webtransport)](https://crates.io/crates/connectrpc-webtransport)
+
 Connect RPC over WebTransport (HTTP/3). Each QUIC bidi stream carries one
 HTTP/1.1 exchange; see [`PROTOCOL.md`](../PROTOCOL.md).
 

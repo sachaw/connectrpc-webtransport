@@ -1,5 +1,7 @@
 # @sachaw/connectrpc-webtransport
 
+[![JSR](https://jsr.io/badges/@sachaw/connectrpc-webtransport)](https://jsr.io/@sachaw/connectrpc-webtransport)
+
 A [Connect](https://connectrpc.com) `Transport` over WebTransport, giving
 browsers client-streaming and bidi RPCs. Codecs, errors, interceptors, limits
 and generated clients are Connect's own.
