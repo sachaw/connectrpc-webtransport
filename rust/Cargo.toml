@@ -1,0 +1,38 @@
+[package]
+name = "connectrpc-webtransport"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+description = "Connect RPC over WebTransport (HTTP/3)"
+repository = "https://github.com/sachaw/connectrpc-webtransport"
+keywords = ["connectrpc", "webtransport", "http3", "quic", "rpc"]
+categories = ["network-programming", "web-programming", "asynchronous"]
+
+[features]
+default = ["server", "client"]
+server = ["dep:tower", "hyper/server"]
+client = ["dep:connectrpc", "dep:futures-util", "hyper/client", "tokio/time"]
+
+[dependencies]
+bytes = "1"
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "macros", "io-util"] }
+tokio-util = "0.7"
+tracing = "0.1"
+wtransport = "0.7"
+connectrpc = { version = "0.9", default-features = false, optional = true }
+futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
+tower = { version = "0.5", features = ["util"], optional = true }
+
+[dev-dependencies]
+futures-util = { version = "0.3", default-features = false }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "process"] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
