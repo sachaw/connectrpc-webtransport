@@ -1,9 +1,9 @@
-// Driven by the crate's `conformance` test, which serves the echo service and sets the env.
+// Driven by the crate's `conformance` test.
 
 import { assertEquals, assertRejects } from "@std/assert";
 import { Code, ConnectError, createClient } from "@connectrpc/connect";
-import { createWebTransportTransport } from "./mod.ts";
-import { EchoService } from "../testing/echo_pb.ts";
+import { createWebTransportTransport } from "../src/mod.ts";
+import { EchoService } from "./support/echo_pb.ts";
 
 const port = Deno.env.get("ECHO_PORT");
 const hash = Deno.env.get("ECHO_HASH");
@@ -57,7 +57,6 @@ Deno.test(
     });
 
     await t.step("bidi", async () => {
-      // Deno never sends FIN; the chunked terminator ends the request, so this loop ends on its own.
       const texts: string[] = [];
       for await (
         const m of client.bidi((async function* () {

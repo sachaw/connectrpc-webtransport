@@ -1,6 +1,6 @@
-// A QUIC listener serving the echo service; prints its port. Driven by the crate's `conformance` test.
+// Serves the echo service on a QUIC listener and prints its port.
 
-import { createWebTransportServer } from "../src/mod.ts";
+import { createWebTransportServer } from "../../src/mod.ts";
 import { echo, EchoService } from "./echo_service.ts";
 
 const serve = createWebTransportServer({
@@ -11,6 +11,8 @@ const listener = endpoint.listen({
   cert: Deno.env.get("ECHO_CERT")!,
   key: Deno.env.get("ECHO_KEY")!,
   alpnProtocols: ["h3"],
+  // denoland/deno#36822.
+  maxConcurrentBidirectionalStreams: 1 << 20,
 });
 console.log(endpoint.addr.port);
 for await (const incoming of listener) {

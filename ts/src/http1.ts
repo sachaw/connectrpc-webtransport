@@ -72,7 +72,15 @@ export class Http1Reader {
     const headers = new Headers();
     for (const line of lines) {
       const colon = line.indexOf(":");
-      headers.append(line.slice(0, colon).trim(), line.slice(colon + 1).trim());
+      if (colon < 1) throw malformed(`header line: ${line}`);
+      try {
+        headers.append(
+          line.slice(0, colon).trim(),
+          line.slice(colon + 1).trim(),
+        );
+      } catch {
+        throw malformed(`header: ${line}`);
+      }
     }
     return { startLine, headers };
   }
@@ -86,7 +94,13 @@ export class Http1Reader {
       return this.#chunked();
     }
     const length = headers.get("content-length");
-    if (length !== null) return this.#take(Number(length));
+    if (length !== null) {
+      const n = Number(length);
+      if (!Number.isSafeInteger(n) || n < 0) {
+        return failing(malformed(`content-length: ${length}`));
+      }
+      return this.#take(n);
+    }
     return kind === "response" ? this.#take(Infinity) : this.#take(0);
   }
 
@@ -127,16 +141,25 @@ export class Http1Reader {
   // RFC 9112 §7.1; trailers are dropped (Connect does not use them).
   async *#chunked(): AsyncIterable<Uint8Array> {
     for (;;) {
-      const size = parseInt(await this.#line(), 16);
-      if (!Number.isInteger(size)) {
-        throw new ConnectError("invalid chunk size", Code.Internal);
-      }
+      const line = await this.#line();
+      const size = /^[0-9a-f]+(;|$)/i.test(line) ? parseInt(line, 16) : NaN;
+      if (!Number.isSafeInteger(size)) throw malformed(`chunk size: ${line}`);
       if (size === 0) break;
       yield* this.#take(size);
       await this.#line();
     }
     while ((await this.#line()) !== "");
   }
+}
+
+function failing(error: ConnectError): AsyncIterable<Uint8Array> {
+  return {
+    [Symbol.asyncIterator]: () => ({ next: () => Promise.reject(error) }),
+  };
+}
+
+function malformed(what: string): ConnectError {
+  return new ConnectError(`malformed ${what}`, Code.Internal);
 }
 
 function indexOfHeadEnd(buf: Uint8Array): number {

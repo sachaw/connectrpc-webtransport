@@ -1,6 +1,6 @@
 [package]
 name = "connectrpc-webtransport"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license = "MPL-2.0"
 description = "Connect RPC over WebTransport (HTTP/3)"
@@ -10,7 +10,7 @@ categories = ["network-programming", "web-programming", "asynchronous"]
 
 [features]
 default = ["server", "client"]
-server = ["dep:tower", "hyper/server"]
+server = ["dep:tower", "hyper/server", "tokio/time"]
 client = ["dep:connectrpc", "dep:futures-util", "hyper/client", "tokio/time"]
 
 [dependencies]
@@ -31,8 +31,14 @@ tower = { version = "0.5", features = ["util"], optional = true }
 
 [dev-dependencies]
 futures-util = { version = "0.3", default-features = false }
+rcgen = { version = "0.14", default-features = false, features = ["ring"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "process"] }
 
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
+
+[[bench]]
+name = "rpc"
+harness = false
+required-features = ["server", "client"]

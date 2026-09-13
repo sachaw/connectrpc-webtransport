@@ -7,6 +7,7 @@ import {
   type Transport,
 } from "@connectrpc/connect";
 import {
+  type Compression,
   createAsyncIterable,
   createMethodSerializationLookup,
   pipe,
@@ -14,6 +15,8 @@ import {
   runStreamingCall,
   runUnaryCall,
   sinkAllBytes,
+  transformCompressEnvelope,
+  transformDecompressEnvelope,
   transformJoinEnvelopes,
   transformParseEnvelope,
   transformSerializeEnvelope,
@@ -23,9 +26,10 @@ import {
   createEndStreamSerialization,
   endStreamFlag,
   errorFromJsonBytes,
-  requestHeader,
+  headerUnaryEncoding,
+  requestHeaderWithCompression,
   trailerDemux,
-  validateResponse,
+  validateResponseWithCompression,
 } from "@connectrpc/connect/protocol-connect";
 import {
   encodeChunk,
@@ -55,7 +59,7 @@ export interface LinkState {
 export interface WebTransportTransportOptions {
   /** A ready session, or a factory: opened on the first RPC, re-opened with backoff when it closes. */
   session: WebTransport | (() => Promise<WebTransport>);
-  /** Binary protobuf (default) or JSON. Connect's HTTP transports default to JSON. */
+  /** Binary protobuf (default) or JSON. */
   useBinaryFormat?: boolean;
   interceptors?: Interceptor[];
   jsonOptions?: Partial<JsonReadOptions & JsonWriteOptions>;
@@ -63,10 +67,17 @@ export interface WebTransportTransportOptions {
   readMaxBytes?: number;
   writeMaxBytes?: number;
   defaultTimeoutMs?: number;
+  acceptCompression?: Compression[];
+  sendCompression?: Compression | null;
+  compressMinBytes?: number;
+  /** QUIC send priority for a call's stream; higher is sent first. */
+  sendOrder?: (method: DescMethod) => number;
   /** Delay between failed opens, doubling from `initialMs` up to `maxMs`. */
   backoff?: { initialMs: number; maxMs: number };
-  /** Called on every session transition. Factory sessions only. */
+  /** Called on every session transition of a factory session. */
   onState?: (state: LinkState) => void;
+  /** Closes the session and stops re-opening it; later calls fail with `Canceled`. */
+  signal?: AbortSignal;
 }
 
 const MAX_BYTES = 0xffffffff;
@@ -79,10 +90,16 @@ export function createWebTransportTransport(
     readMaxBytes: options.readMaxBytes ?? MAX_BYTES,
     writeMaxBytes: options.writeMaxBytes ?? MAX_BYTES,
   };
+  const acceptCompression = options.acceptCompression ?? [];
+  const sendCompression = options.sendCompression ?? null;
+  const compressMinBytes = options.compressMinBytes ?? 1024;
   const source = typeof options.session === "function"
     ? reconnecting(options.session, options)
-    : () => Promise.resolve(options.session as WebTransport);
+    : fixed(options.session, options.signal);
   const session = async () => {
+    if (options.signal?.aborted) {
+      throw new ConnectError("transport closed", Code.Canceled);
+    }
     try {
       return await source();
     } catch (e) {
@@ -91,6 +108,20 @@ export function createWebTransportTransport(
   };
   const timeout = (ms: number | undefined) =>
     ms === undefined ? options.defaultTimeoutMs : ms <= 0 ? undefined : ms;
+  const requestHeader = (
+    method: DescMethod,
+    timeoutMs: number | undefined,
+    header: HeadersInit | undefined,
+  ) =>
+    requestHeaderWithCompression(
+      method.methodKind,
+      useBinaryFormat,
+      timeoutMs,
+      header,
+      acceptCompression,
+      sendCompression,
+      false,
+    );
 
   return {
     async unary(method, signal, timeoutMs, header, message, contextValues) {
@@ -111,41 +142,45 @@ export function createWebTransportTransport(
           method,
           requestMethod: "POST",
           url: path(method),
-          header: requestHeader(
-            method.methodKind,
-            useBinaryFormat,
-            timeoutMs,
-            header,
-            false,
-          ),
+          header: requestHeader(method, timeoutMs, header),
           contextValues: contextValues ?? createContextValues(),
           message,
         },
         next: async (req) => {
-          const body = serialization.getI(useBinaryFormat).serialize(
-            req.message,
-          );
+          let body = serialization.getI(useBinaryFormat).serialize(req.message);
+          if (sendCompression && body.byteLength > compressMinBytes) {
+            body = await sendCompression.compress(body);
+            req.header.set(headerUnaryEncoding, sendCompression.name);
+          } else {
+            req.header.delete(headerUnaryEncoding);
+          }
           const call = await open(
             await session(),
             req.url,
             req.header,
             req.signal,
             body.byteLength,
+            options.sendOrder?.(method),
           );
           await call.send(createAsyncIterable([body]));
           const res = await call.response();
-          const { isUnaryError, unaryError } = validateResponse(
-            method.methodKind,
-            useBinaryFormat,
-            res.status,
-            res.header,
-          );
+          const { compression, isUnaryError, unaryError } =
+            validateResponseWithCompression(
+              method.methodKind,
+              acceptCompression,
+              useBinaryFormat,
+              res.status,
+              res.header,
+            );
           const [resHeader, trailer] = trailerDemux(res.header);
-          const bytes = await pipeTo(
+          let bytes = await pipeTo(
             res.body,
             sinkAllBytes(limits.readMaxBytes, res.header.get("content-length")),
             { propagateDownStreamError: false },
           );
+          if (compression) {
+            bytes = await compression.decompress(bytes, limits.readMaxBytes);
+          }
           if (isUnaryError) {
             throw errorFromJsonBytes(
               bytes,
@@ -186,13 +221,7 @@ export function createWebTransportTransport(
           method,
           requestMethod: "POST",
           url: path(method),
-          header: requestHeader(
-            method.methodKind,
-            useBinaryFormat,
-            timeoutMs,
-            header,
-            false,
-          ),
+          header: requestHeader(method, timeoutMs, header),
           contextValues: contextValues ?? createContextValues(),
           message: input,
         },
@@ -200,10 +229,12 @@ export function createWebTransportTransport(
           const body = pipe(
             req.message,
             transformSerializeEnvelope(serialization.getI(useBinaryFormat)),
+            transformCompressEnvelope(sendCompression, compressMinBytes),
             transformJoinEnvelopes(),
             { propagateDownStreamError: true },
           );
           const wt = await session();
+          const sendOrder = options.sendOrder?.(method);
           let call: Call;
           if (method.methodKind === "server_streaming") {
             const bytes = await pipeTo(body, sinkAllBytes(MAX_BYTES), {
@@ -215,15 +246,24 @@ export function createWebTransportTransport(
               req.header,
               req.signal,
               bytes.byteLength,
+              sendOrder,
             );
             await call.send(createAsyncIterable([bytes]));
           } else {
-            call = await open(wt, req.url, req.header, req.signal);
+            call = await open(
+              wt,
+              req.url,
+              req.header,
+              req.signal,
+              undefined,
+              sendOrder,
+            );
             void call.send(body).catch(() => {});
           }
           const res = await call.response();
-          validateResponse(
+          const { compression } = validateResponseWithCompression(
             method.methodKind,
+            acceptCompression,
             useBinaryFormat,
             res.status,
             res.header,
@@ -232,6 +272,10 @@ export function createWebTransportTransport(
           const message = pipe(
             res.body,
             transformSplitEnvelope(limits.readMaxBytes),
+            transformDecompressEnvelope(
+              compression ?? null,
+              limits.readMaxBytes,
+            ),
             transformParseEnvelope(
               serialization.getO(useBinaryFormat),
               endStreamFlag,
@@ -286,24 +330,27 @@ function path(method: DescMethod): string {
 }
 
 interface Call {
-  /** Writes the body and half-closes. Returns early if the peer stops reading; a failing body aborts the stream. */
+  /** Writes the body and half-closes; a failing body aborts the stream. */
   send(body: AsyncIterable<Uint8Array>): Promise<void>;
   response(): Promise<
     { status: number; header: Headers; body: AsyncIterable<Uint8Array> }
   >;
 }
 
-// A known-length request carries content-length; otherwise it is chunked, so its end never depends on the stream's FIN (Deno never sends one).
+// A known-length request carries content-length; otherwise it is chunked, so its end never depends on the stream's FIN.
 async function open(
   session: WebTransport,
   path: string,
   header: Headers,
   signal: AbortSignal | undefined,
-  contentLength?: number,
+  contentLength: number | undefined,
+  sendOrder: number | undefined,
 ): Promise<Call> {
-  const stream = await session.createBidirectionalStream().catch((e) => {
-    throw ConnectError.from(e, Code.Unavailable);
-  });
+  const stream = await session.createBidirectionalStream({ sendOrder }).catch(
+    (e) => {
+      throw ConnectError.from(e, Code.Unavailable);
+    },
+  );
   const writer = stream.writable.getWriter();
   const reader = new Http1Reader(stream.readable.getReader());
   let aborted: unknown;
@@ -379,9 +426,17 @@ async function open(
   };
 }
 
+function fixed(
+  session: WebTransport,
+  signal?: AbortSignal,
+): () => Promise<WebTransport> {
+  signal?.addEventListener("abort", () => session.close(), { once: true });
+  return () => Promise.resolve(session);
+}
+
 function reconnecting(
   open: () => Promise<WebTransport>,
-  options: Pick<WebTransportTransportOptions, "backoff" | "onState">,
+  options: Pick<WebTransportTransportOptions, "backoff" | "onState" | "signal">,
 ): () => Promise<WebTransport> {
   const { initialMs, maxMs } = options.backoff ??
     { initialMs: 500, maxMs: 5_000 };
@@ -389,9 +444,15 @@ function reconnecting(
   let failures = 0;
   let nextAttemptAt = 0;
   let everConnected = false;
-  const emit = (phase: LinkPhase) =>
-    options.onState?.({ phase, failures, nextAttemptAt });
+  const closed = () => options.signal?.aborted === true;
+  const emit = (phase: LinkPhase) => {
+    if (!closed()) options.onState?.({ phase, failures, nextAttemptAt });
+  };
   const down = (): LinkPhase => everConnected ? "reconnecting" : "connecting";
+  options.signal?.addEventListener("abort", () => {
+    current?.then((session) => session.close(), () => {});
+    current = null;
+  }, { once: true });
 
   const dial = (): Promise<WebTransport> => {
     const wait = Math.max(0, nextAttemptAt - Date.now());
@@ -401,6 +462,10 @@ function reconnecting(
       .then(open)
       .then(
         (session) => {
+          if (closed()) {
+            session.close();
+            return session;
+          }
           failures = 0;
           nextAttemptAt = 0;
           everConnected = true;
@@ -415,8 +480,8 @@ function reconnecting(
         },
         (e) => {
           failures += 1;
-          nextAttemptAt = Date.now() +
-            Math.min(maxMs, initialMs * 2 ** (failures - 1));
+          const backoff = Math.min(maxMs, initialMs * 2 ** (failures - 1));
+          nextAttemptAt = Date.now() + backoff * (0.5 + Math.random() / 2);
           if (current === attempt) current = null;
           emit(down());
           throw e;

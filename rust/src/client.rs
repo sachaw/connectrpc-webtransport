@@ -1,6 +1,7 @@
 //! A connectrpc [`ClientTransport`] over WebTransport.
 
 use std::future::Future;
+use std::hash::{BuildHasher, RandomState};
 use std::io;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -13,7 +14,8 @@ use http::header::HOST;
 use http::{HeaderValue, Request, Response};
 use http_body_util::BodyExt;
 use hyper::client::conn::http1;
-use wtransport::{ClientConfig, Connection, Endpoint};
+use wtransport::error::ConnectionError;
+use wtransport::{ClientConfig, Connection, Endpoint, VarInt};
 
 use crate::{Body, Error, stream_io};
 
@@ -51,9 +53,14 @@ impl Default for ReconnectOptions {
     }
 }
 
-/// Opens one bidi stream per RPC. Cheap to clone.
+type Priority = Arc<dyn Fn(&http::Uri) -> i32 + Send + Sync>;
+
+/// Opens one bidi stream per RPC; cheap to clone.
 #[derive(Clone)]
-pub struct Transport(Arc<Inner>);
+pub struct Transport {
+    inner: Arc<Inner>,
+    priority: Option<Priority>,
+}
 
 enum Inner {
     Fixed(Connection),
@@ -63,7 +70,16 @@ enum Inner {
 impl Transport {
     /// Use an existing session as-is.
     pub fn new(connection: Connection) -> Self {
-        Self(Arc::new(Inner::Fixed(connection)))
+        Self::from(Inner::Fixed(connection))
+    }
+
+    /// QUIC send priority for each call's stream, by request URI; higher is sent first.
+    pub fn with_priority(
+        mut self,
+        priority: impl Fn(&http::Uri) -> i32 + Send + Sync + 'static,
+    ) -> Self {
+        self.priority = Some(Arc::new(priority));
+        self
     }
 
     /// Open on the first RPC and re-open with backoff whenever the session closes.
@@ -73,17 +89,29 @@ impl Transport {
         F: Fn() -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Connection, Error>> + Send + 'static,
     {
-        Self(Arc::new(Inner::Reconnecting(Arc::new(Reconnecting {
+        Self::from(Inner::Reconnecting(Arc::new(Reconnecting {
             open: Box::new(move || open().boxed()),
             options,
             link: Mutex::default(),
-        }))))
+        })))
+    }
+
+    /// Close the session; a reconnecting transport also stops redialling.
+    /// Later calls fail with [`ConnectionError::LocallyClosed`].
+    pub fn close(&self) {
+        match &*self.inner {
+            Inner::Fixed(connection) => connection.close(VarInt::from_u32(0), b""),
+            Inner::Reconnecting(link) => link.close(),
+        }
     }
 
     async fn session(&self) -> Result<Connection, Error> {
-        match &*self.0 {
+        match &*self.inner {
             Inner::Fixed(connection) => Ok(connection.clone()),
-            Inner::Reconnecting(link) => link.session().await.map_err(Error::Session),
+            Inner::Reconnecting(link) => match link.session() {
+                Some(dial) => dial.await.map_err(Error::Session),
+                None => Err(ConnectionError::LocallyClosed.into()),
+            },
         }
     }
 }
@@ -113,6 +141,15 @@ pub fn reconnect(
     ))
 }
 
+impl From<Inner> for Transport {
+    fn from(inner: Inner) -> Self {
+        Self {
+            inner: Arc::new(inner),
+            priority: None,
+        }
+    }
+}
+
 impl ClientTransport for Transport {
     type ResponseBody = Body;
     type Error = Error;
@@ -122,13 +159,17 @@ impl ClientTransport for Transport {
         request: Request<ClientBody>,
     ) -> Pin<Box<dyn Future<Output = Result<Response<Body>, Error>> + Send + 'static>> {
         let transport = self.clone();
-        Box::pin(async move { call(transport.session().await?, request).await })
+        Box::pin(async move {
+            let priority = transport.priority.as_ref().map(|p| p(request.uri()));
+            call(transport.session().await?, request, priority).await
+        })
     }
 }
 
 async fn call(
     connection: Connection,
     mut request: Request<ClientBody>,
+    priority: Option<i32>,
 ) -> Result<Response<Body>, Error> {
     // connectrpc builds absolute URIs; HTTP/1.1 wants origin-form plus Host.
     if let Some(authority) = request.uri().authority().cloned() {
@@ -144,6 +185,9 @@ async fn call(
     }
 
     let (send, recv) = connection.open_bi().await?.await?;
+    if let Some(priority) = priority {
+        send.set_priority(priority);
+    }
     let (mut sender, conn) = http1::handshake(stream_io(send, recv)).await?;
     tokio::spawn(async move {
         if let Err(e) = conn.await {
@@ -169,6 +213,7 @@ struct Link {
     failures: u32,
     next_attempt_at: Option<Instant>,
     ever_connected: bool,
+    closed: bool,
 }
 
 impl Link {
@@ -189,20 +234,43 @@ impl Link {
     }
 }
 
+impl Drop for Reconnecting {
+    fn drop(&mut self) {
+        close_current(self.link.get_mut().unwrap());
+    }
+}
+
+fn close_current(link: &mut Link) {
+    link.closed = true;
+    if let Some(Some(Ok(connection))) = link.current.take().map(|(_, dial)| dial.peek().cloned()) {
+        connection.close(VarInt::from_u32(0), b"");
+    }
+}
+
 impl Reconnecting {
-    fn session(self: &Arc<Self>) -> Dial {
+    fn close(&self) {
+        close_current(&mut self.link.lock().unwrap());
+    }
+
+    fn session(self: &Arc<Self>) -> Option<Dial> {
         let mut link = self.link.lock().unwrap();
+        if link.closed {
+            return None;
+        }
         if let Some((_, dial)) = &link.current {
-            return dial.clone();
+            return Some(dial.clone());
         }
         link.generation += 1;
         let generation = link.generation;
         let wait = link.next_attempt_at.map_or(Duration::ZERO, |at| {
             at.saturating_duration_since(Instant::now())
         });
-        let this = self.clone();
+        let weak = Arc::downgrade(self);
         let dial: Dial = async move {
             tokio::time::sleep(wait).await;
+            let Some(this) = weak.upgrade() else {
+                return Err(Arc::new(ConnectionError::LocallyClosed.into()));
+            };
             match (this.open)().await {
                 Ok(connection) => {
                     this.connected(generation, &connection);
@@ -217,12 +285,16 @@ impl Reconnecting {
         .boxed()
         .shared();
         link.current = Some((generation, dial.clone()));
-        dial
+        Some(dial)
     }
 
     fn connected(self: &Arc<Self>, generation: u64, connection: &Connection) {
         let state = {
             let mut link = self.link.lock().unwrap();
+            if link.closed {
+                connection.close(VarInt::from_u32(0), b"");
+                return;
+            }
             link.failures = 0;
             link.next_attempt_at = None;
             link.ever_connected = true;
@@ -230,10 +302,13 @@ impl Reconnecting {
         };
         self.emit(state);
 
-        let this = self.clone();
+        let weak = Arc::downgrade(self);
         let connection = connection.clone();
         tokio::spawn(async move {
             connection.closed().await;
+            let Some(this) = weak.upgrade() else {
+                return;
+            };
             let state = {
                 let mut link = this.link.lock().unwrap();
                 if !link.current.as_ref().is_some_and(|(g, _)| *g == generation) {
@@ -249,12 +324,16 @@ impl Reconnecting {
     fn failed(&self, generation: u64) {
         let state = {
             let mut link = self.link.lock().unwrap();
+            if link.closed {
+                return;
+            }
             link.failures += 1;
             let backoff = self
                 .options
                 .initial_backoff
                 .saturating_mul(1u32 << (link.failures - 1).min(31))
-                .min(self.options.max_backoff);
+                .min(self.options.max_backoff)
+                .mul_f64(0.5 + 0.5 * jitter());
             link.next_attempt_at = Some(Instant::now() + backoff);
             if link.current.as_ref().is_some_and(|(g, _)| *g == generation) {
                 link.current = None;
@@ -270,4 +349,8 @@ impl Reconnecting {
             on_state(state);
         }
     }
+}
+
+fn jitter() -> f64 {
+    (RandomState::new().hash_one(0) >> 11) as f64 / (1u64 << 53) as f64
 }

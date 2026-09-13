@@ -2,7 +2,9 @@
 export function memorySessionPair(): {
   client: WebTransport;
   server: WebTransport;
+  sendOrders: (number | undefined)[];
 } {
+  const sendOrders: (number | undefined)[] = [];
   const closed = Promise.withResolvers<WebTransportCloseInfo>();
   let incoming!: ReadableStreamDefaultController<
     WebTransportBidirectionalStream
@@ -24,7 +26,8 @@ export function memorySessionPair(): {
   const common = { ready: Promise.resolve(), closed: closed.promise, close };
   const client = {
     ...common,
-    createBidirectionalStream() {
+    createBidirectionalStream(options?: WebTransportSendStreamOptions) {
+      sendOrders.push(options?.sendOrder);
       const toServer = pipe();
       const toClient = pipe();
       incoming.enqueue(bidi(toServer.readable, toClient.writable));
@@ -35,7 +38,7 @@ export function memorySessionPair(): {
     ...common,
     incomingBidirectionalStreams,
   } as unknown as WebTransport;
-  return { client, server };
+  return { client, server, sendOrders };
 }
 
 function bidi(

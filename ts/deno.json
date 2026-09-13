@@ -1,6 +1,6 @@
 {
   "name": "@sachaw/connectrpc-webtransport",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "license": "MPL-2.0",
   "exports": "./src/mod.ts",
   "imports": {
@@ -12,8 +12,11 @@
     "net"
   ],
   "exclude": [
-    "testing/echo_pb.ts"
+    "tests/support/echo_pb.ts"
   ],
+  "fmt": {
+    "proseWrap": "preserve"
+  },
   "tasks": {
     "check": "deno check src/mod.ts && deno lint && deno fmt --check",
     "test": "deno test --allow-net --allow-env=ECHO_PORT,ECHO_HASH"
@@ -24,6 +27,7 @@
       "src/transport.ts",
       "src/server.ts",
       "src/http1.ts",
+      "src/compression.ts",
       "README.md",
       "deno.json"
     ]

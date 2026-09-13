@@ -66,7 +66,15 @@ async fn typescript_client_conforms() {
     let cancel = CancellationToken::new();
     let server = tokio::spawn({
         let cancel = cancel.clone();
-        async move { connectrpc_webtransport::server::serve(&endpoint, service_fn(echo), cancel).await }
+        async move {
+            connectrpc_webtransport::server::serve(
+                &endpoint,
+                service_fn(echo),
+                Default::default(),
+                cancel,
+            )
+            .await
+        }
     });
 
     let status = tokio::process::Command::new("deno")
@@ -74,7 +82,7 @@ async fn typescript_client_conforms() {
             "test",
             "--allow-net",
             "--allow-env=ECHO_PORT,ECHO_HASH",
-            "src/conformance_test.ts",
+            "tests/conformance_test.ts",
         ])
         .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../ts"))
         .env("ECHO_PORT", port.to_string())
@@ -212,7 +220,7 @@ async fn typescript_server_conforms() {
             "run",
             "--allow-net",
             "--allow-env=ECHO_CERT,ECHO_KEY",
-            "testing/serve.ts",
+            "tests/support/serve.ts",
         ])
         .current_dir(TS_DIR)
         .env("ECHO_CERT", leaf.to_pem())

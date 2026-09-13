@@ -25,6 +25,10 @@ async fn echo(req: http::Request<Body>) -> Result<http::Response<Body>, Infallib
     let path = req.uri().path().to_string();
     let method = req.method().to_string();
     let host = req.headers().get("host").cloned();
+    let peer = req
+        .extensions()
+        .get::<wtransport::Connection>()
+        .map(|c| c.remote_address().to_string());
     let body: Body = if path.ends_with("/Bidi") {
         // Echo frames as they arrive, so the response streams alongside the request.
         req.into_body()
@@ -39,6 +43,9 @@ async fn echo(req: http::Request<Body>) -> Result<http::Response<Body>, Infallib
     if let Some(host) = host {
         response = response.header("x-req-host", host);
     }
+    if let Some(peer) = peer {
+        response = response.header("x-req-peer", peer);
+    }
     Ok(response.body(body).unwrap())
 }
 
@@ -46,7 +53,12 @@ struct Fixture {
     endpoint: Arc<Endpoint<Server>>,
     digest: Sha256Digest,
     cancel: CancellationToken,
+    serving: Option<tokio::task::JoinHandle<()>>,
+    /// The server-side connection of the most recent call.
+    peer: Arc<std::sync::Mutex<Option<wtransport::Connection>>>,
 }
+
+const DRAIN: Duration = Duration::from_millis(300);
 
 impl Drop for Fixture {
     fn drop(&mut self) {
@@ -62,9 +74,23 @@ impl Fixture {
         )
     }
 
-    fn serve(&self) {
-        let (endpoint, cancel) = (self.endpoint.clone(), self.cancel.clone());
-        tokio::spawn(async move { server::serve(&endpoint, service_fn(echo), cancel).await });
+    fn serve(&mut self) {
+        let (endpoint, cancel, peer) = (
+            self.endpoint.clone(),
+            self.cancel.clone(),
+            self.peer.clone(),
+        );
+        let options = server::ServeOptions {
+            drain: DRAIN,
+            ..Default::default()
+        };
+        let service = service_fn(move |req: http::Request<Body>| {
+            *peer.lock().unwrap() = req.extensions().get::<wtransport::Connection>().cloned();
+            echo(req)
+        });
+        self.serving = Some(tokio::spawn(async move {
+            server::serve(&endpoint, service, options, cancel).await
+        }));
     }
 
     /// Drop every session and start serving again on the same endpoint.
@@ -99,10 +125,12 @@ async fn start() -> Fixture {
         )
         .unwrap(),
     );
-    let f = Fixture {
+    let mut f = Fixture {
         endpoint,
         digest,
         cancel: CancellationToken::new(),
+        serving: None,
+        peer: Default::default(),
     };
     f.serve();
     f
@@ -134,6 +162,12 @@ async fn unary_round_trips_with_status_and_headers() {
     assert_eq!(response.headers()["x-req-method"], "POST");
     assert_eq!(response.headers()["x-req-path"], "/test.v1.Test/Ping");
     assert_eq!(response.headers()["x-req-host"], "127.0.0.1:1");
+    assert!(
+        response.headers()["x-req-peer"]
+            .to_str()
+            .unwrap()
+            .starts_with("127.0.0.1:")
+    );
     assert_eq!(
         response.into_body().collect().await.unwrap().to_bytes(),
         &b"ping"[..]
@@ -389,4 +423,100 @@ async fn connection_outlives_its_endpoint_handle() {
         response.into_body().collect().await.unwrap().to_bytes(),
         &b"ping"[..]
     );
+}
+
+#[tokio::test]
+async fn shutdown_drains_in_flight_calls_then_closes() {
+    let mut f = start().await;
+    let transport = client::connect(&f.url(), f.client_config()).await.unwrap();
+
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<http_body::Frame<Bytes>, Infallible>>(4);
+    let body: ClientBody = StreamBody::new(tokio_stream_from(rx))
+        .map_err(|e: Infallible| match e {})
+        .boxed();
+    tx.send(Ok(http_body::Frame::data(Bytes::from_static(b"open"))))
+        .await
+        .unwrap();
+    let mut response = transport
+        .send(request("/test.v1.Test/Bidi", body))
+        .await
+        .unwrap();
+    response.body_mut().frame().await.unwrap().unwrap();
+
+    let started = std::time::Instant::now();
+    f.cancel.cancel();
+    tx.send(Ok(http_body::Frame::data(Bytes::from_static(b"more"))))
+        .await
+        .unwrap();
+    let echoed = response.body_mut().frame().await.unwrap().unwrap();
+    assert_eq!(echoed.into_data().unwrap(), &b"more"[..]);
+
+    assert!(response.into_body().collect().await.is_err());
+    tokio::time::timeout(Duration::from_secs(5), f.serving.take().unwrap())
+        .await
+        .expect("serve must return after the drain")
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert!(elapsed >= DRAIN && elapsed < DRAIN * 5, "{elapsed:?}");
+    drop(tx);
+}
+
+#[tokio::test]
+async fn close_ends_the_session_and_stops_redialling() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    use connectrpc_webtransport::client::{ReconnectOptions, Transport};
+
+    let f = start().await;
+    let endpoint = Arc::new(wtransport::Endpoint::client(f.client_config()).unwrap());
+    let url = f.url();
+    let opens = Arc::new(AtomicU32::new(0));
+    let transport = Transport::reconnecting(
+        {
+            let (opens, endpoint) = (opens.clone(), endpoint.clone());
+            move || {
+                opens.fetch_add(1, Ordering::SeqCst);
+                let (endpoint, url) = (endpoint.clone(), url.clone());
+                async move { Ok(endpoint.connect(url).await?) }
+            }
+        },
+        ReconnectOptions::default(),
+    );
+    transport
+        .send(request("/test.v1.Test/Ping", full(b"1")))
+        .await
+        .unwrap();
+
+    transport.close();
+    assert!(
+        transport
+            .send(request("/test.v1.Test/Ping", full(b"2")))
+            .await
+            .is_err()
+    );
+    assert_eq!(opens.load(Ordering::SeqCst), 1);
+
+    let fixed = client::connect(&f.url(), f.client_config()).await.unwrap();
+    fixed.close();
+    assert!(
+        fixed
+            .send(request("/test.v1.Test/Ping", full(b"3")))
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn dropping_the_last_handle_ends_a_reconnecting_session() {
+    let f = start().await;
+    let transport = client::reconnect(f.url(), f.client_config(), Default::default()).unwrap();
+    transport
+        .send(request("/test.v1.Test/Ping", full(b"1")))
+        .await
+        .unwrap();
+    let connection = f.peer.lock().unwrap().clone().unwrap();
+    drop(transport);
+    tokio::time::timeout(Duration::from_secs(2), connection.closed())
+        .await
+        .expect("the session must close once no handle remains");
 }

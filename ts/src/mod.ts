@@ -29,3 +29,4 @@ export type {
   WebTransportServer,
   WebTransportServerOptions,
 } from "./server.ts";
+export { compressionGzip } from "./compression.ts";
