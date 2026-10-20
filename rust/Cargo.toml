@@ -1,6 +1,6 @@
 [package]
 name = "connectrpc-webtransport"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 license = "MPL-2.0"
 description = "Connect RPC over WebTransport (HTTP/3)"

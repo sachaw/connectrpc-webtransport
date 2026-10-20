@@ -1,6 +1,6 @@
 {
   "name": "@sachaw/connectrpc-webtransport",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "license": "MPL-2.0",
   "exports": "./src/mod.ts",
   "imports": {
