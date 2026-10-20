@@ -340,3 +340,116 @@ Deno.test("onSession sees sessions open and close", async () => {
   await new Promise((r) => setTimeout(r, 0));
   assertEquals(events, ["open", "close"]);
 });
+
+/** A client session that records how each of its streams was abandoned. */
+function recording(client: WebTransport) {
+  const abandoned: { reset?: unknown; stopped?: unknown }[] = [];
+  const session = {
+    ...client,
+    ready: client.ready,
+    closed: client.closed,
+    close: () => client.close(),
+    async createBidirectionalStream(options?: WebTransportSendStreamOptions) {
+      const inner = await client.createBidirectionalStream(options);
+      const seen: { reset?: unknown; stopped?: unknown } = {};
+      abandoned.push(seen);
+      const reader = inner.readable.getReader();
+      const writer = inner.writable.getWriter();
+      return {
+        readable: new ReadableStream<Uint8Array>({
+          async pull(c) {
+            const r = await reader.read();
+            if (r.done) c.close();
+            else c.enqueue(r.value);
+          },
+          cancel: (reason) => void (seen.stopped = reason),
+        }),
+        writable: new WritableStream<Uint8Array>({
+          write: (chunk) => writer.write(chunk),
+          close: () => writer.close(),
+          abort: (reason) => void (seen.reset = reason),
+        }),
+      } as unknown as WebTransportBidirectionalStream;
+    },
+  } as unknown as WebTransport;
+  return { session, abandoned };
+}
+
+function streamErrorCode(reason: unknown): number | null {
+  assert(reason instanceof WebTransportError, String(reason));
+  return reason.streamErrorCode;
+}
+
+Deno.test("an abandoned call resets and stops its stream with the call's Connect code", async () => {
+  const hanging = createWebTransportServer({
+    routes: (router) =>
+      router.service(EchoService, {
+        async *serverStream(req: Echo) {
+          yield { text: req.text };
+          await new Promise<void>(() => {});
+        },
+        async *bidi(reqs: AsyncIterable<Echo>) {
+          for await (const req of reqs) yield { text: req.text };
+        },
+        unary: () => new Promise<Echo>(() => {}),
+      }),
+  });
+  const pair = memorySessionPair();
+  void hanging(pair.server);
+  const { session, abandoned } = recording(pair.client);
+  const client = createClient(
+    EchoService,
+    createWebTransportTransport({ session }),
+  );
+
+  // Its request finished (FIN), a server stream has only its receive side left to stop.
+  const watching = new AbortController();
+  for await (
+    const _ of client.serverStream({ text: "x" }, { signal: watching.signal })
+  ) {
+    watching.abort();
+    break;
+  }
+  // A bidi call is abandoned both ways.
+  const talking = new AbortController();
+  const requests = (async function* () {
+    yield { text: "x" };
+    await new Promise<void>(() => {});
+  })();
+  for await (
+    const _ of client.bidi(requests, { signal: talking.signal })
+  ) {
+    talking.abort();
+    break;
+  }
+  await assertRejects(() => client.unary({ text: "x" }, { timeoutMs: 20 }));
+
+  assertEquals(abandoned.length, 3);
+  assertEquals(abandoned[0].reset, undefined);
+  assertEquals(streamErrorCode(abandoned[0].stopped), Code.Canceled);
+  assertEquals(streamErrorCode(abandoned[1].reset), Code.Canceled);
+  assertEquals(streamErrorCode(abandoned[1].stopped), Code.Canceled);
+  assertEquals(abandoned[2].reset, undefined);
+  assertEquals(
+    streamErrorCode(abandoned[2].stopped),
+    Code.DeadlineExceeded,
+  );
+});
+
+Deno.test("a completed call is not abandoned by a later abort", async () => {
+  const pair = memorySessionPair();
+  void serve(pair.server);
+  const { session, abandoned } = recording(pair.client);
+  const client = createClient(
+    EchoService,
+    createWebTransportTransport({ session }),
+  );
+  const lifetime = new AbortController();
+  await client.unary({ text: "x" }, { signal: lifetime.signal });
+  for await (
+    const _ of client.serverStream({ text: "x" }, { signal: lifetime.signal })
+  );
+  lifetime.abort();
+  assertEquals(abandoned.length, 2);
+  assertEquals(abandoned, [{}, {}]);
+});

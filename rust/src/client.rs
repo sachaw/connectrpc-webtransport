@@ -14,10 +14,11 @@ use http::header::HOST;
 use http::{HeaderValue, Request, Response};
 use http_body_util::BodyExt;
 use hyper::client::conn::http1;
+use tokio::task::AbortHandle;
 use wtransport::error::ConnectionError;
 use wtransport::{ClientConfig, Connection, Endpoint, VarInt};
 
-use crate::{Body, Error, stream_io};
+use crate::{Body, Error, stream};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LinkPhase {
@@ -188,14 +189,68 @@ async fn call(
     if let Some(priority) = priority {
         send.set_priority(priority);
     }
-    let (mut sender, conn) = http1::handshake(stream_io(send, recv)).await?;
-    tokio::spawn(async move {
-        if let Err(e) = conn.await {
-            tracing::debug!(error = %e, "call connection ended");
-        }
-    });
+    let (mut sender, conn) = http1::handshake(stream::io(send, recv)).await?;
+    // Owned by the call: dropped before its response ends, the exchange is abandoned on the wire.
+    let call = Abandon(Some(
+        tokio::spawn(async move {
+            if let Err(e) = conn.await {
+                tracing::debug!(error = %e, "call connection ended");
+            }
+        })
+        .abort_handle(),
+    ));
     let response = sender.send_request(request).await?;
-    Ok(response.map(|b| b.map_err(io::Error::other).boxed()))
+    Ok(response.map(|body| {
+        Owned {
+            body: body.map_err(io::Error::other),
+            call,
+        }
+        .boxed()
+    }))
+}
+
+struct Abandon(Option<AbortHandle>);
+
+impl Drop for Abandon {
+    fn drop(&mut self) {
+        if let Some(call) = self.0.take() {
+            call.abort();
+        }
+    }
+}
+
+/// A response body that holds its call open until the body has ended.
+struct Owned<B> {
+    body: B,
+    call: Abandon,
+}
+
+impl<B> http_body::Body for Owned<B>
+where
+    B: http_body::Body<Data = bytes::Bytes, Error = io::Error> + Unpin,
+{
+    type Data = bytes::Bytes;
+    type Error = io::Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let polled = Pin::new(&mut self.body).poll_frame(cx);
+        if let std::task::Poll::Ready(None) = polled {
+            // Ended: the call completes by itself.
+            self.call.0 = None;
+        }
+        polled
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.body.size_hint()
+    }
 }
 
 type Dial = Shared<BoxFuture<'static, Result<Connection, Arc<Error>>>>;

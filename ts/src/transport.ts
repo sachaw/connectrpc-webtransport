@@ -354,13 +354,25 @@ async function open(
   const writer = stream.writable.getWriter();
   const reader = new Http1Reader(stream.readable.getReader());
   let aborted: unknown;
-  const abort = (reason: unknown) => {
-    aborted = reason;
-    writer.abort(reason).catch(() => {});
-    reader.cancel(reason).catch(() => {});
+  let settled = false;
+  // Once the response has ended the call is complete: a later abort, such as
+  // Connect's own on success, has nothing to abandon, and the stream is let go.
+  const settle = () => {
+    settled = true;
+    signal?.removeEventListener("abort", onAbort);
   };
+  // Abandoned: reset the send side and stop the receive side.
+  const abort = (reason: unknown) => {
+    if (settled) return;
+    settle();
+    aborted = reason;
+    const error = streamError(reason);
+    writer.abort(error).catch(() => {});
+    reader.cancel(error).catch(() => {});
+  };
+  const onAbort = () => abort(signal!.reason);
   if (signal?.aborted) abort(signal.reason);
-  signal?.addEventListener("abort", () => abort(signal.reason), { once: true });
+  signal?.addEventListener("abort", onAbort, { once: true });
 
   const chunked = contentLength === undefined;
   header.delete("transfer-encoding");
@@ -420,10 +432,21 @@ async function open(
             throw aborted ?? e;
           }
           if (aborted !== undefined) throw aborted;
+          settle();
         })(),
       };
     },
   };
+}
+
+// The reason a stream is abandoned with: the call's Connect code as its stream
+// error code (1 canceled, 4 deadline_exceeded), where the runtime has WebTransportError.
+function streamError(reason: unknown): unknown {
+  if (typeof WebTransportError !== "function") return reason;
+  const error = ConnectError.from(reason, Code.Canceled);
+  return new WebTransportError(error.rawMessage, {
+    streamErrorCode: error.code,
+  });
 }
 
 function fixed(

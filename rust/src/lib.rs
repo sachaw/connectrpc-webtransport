@@ -24,9 +24,7 @@ pub mod client;
 pub mod server;
 
 #[cfg(any(feature = "server", feature = "client"))]
-fn stream_io(
-    send: wtransport::SendStream,
-    recv: wtransport::RecvStream,
-) -> hyper_util::rt::TokioIo<tokio::io::Join<wtransport::RecvStream, wtransport::SendStream>> {
-    hyper_util::rt::TokioIo::new(tokio::io::join(recv, send))
-}
+mod stream;
+
+/// The stream error code a call abandoned before it completes is reset and stopped with: Connect's `canceled`.
+pub const CANCELED: u32 = 1;

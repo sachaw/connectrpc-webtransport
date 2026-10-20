@@ -20,7 +20,7 @@ use wtransport::endpoint::endpoint_side::Server;
 use wtransport::error::ConnectionError;
 use wtransport::{Connection, Endpoint, RecvStream, SendStream, VarInt};
 
-use crate::{Body, stream_io};
+use crate::{Body, stream};
 
 #[derive(Clone, Copy, Debug)]
 pub struct ServeOptions {
@@ -143,13 +143,16 @@ where
     B: http_body::Body<Data = Bytes> + Send + 'static,
     B::Error: std::fmt::Display + Send,
 {
-    http1::Builder::new()
+    // A peer that abandons the call stops our send side; that ends the call at once, not at our
+    // next write, which for an idle stream may never come.
+    let stopped = send.quic_stream().stopped();
+    let serving = http1::Builder::new()
         .timer(TokioTimer::new())
         .header_read_timeout(header_timeout)
         .keep_alive(false)
         .half_close(true)
         .serve_connection(
-            stream_io(send, recv),
+            stream::io(send, recv),
             service_fn(move |request: http::Request<Incoming>| {
                 let (service, connection) = (service.clone(), connection.clone());
                 let span = tracing::debug_span!("call", path = %request.uri().path());
@@ -167,6 +170,12 @@ where
                 }
                 .instrument(span)
             }),
-        )
-        .await
+        );
+    tokio::select! {
+        served = serving => served,
+        Ok(Some(code)) = stopped => {
+            tracing::debug!(code = ?stream::webtransport_code(code.into_inner()), "abandoned by the peer");
+            Ok(())
+        }
+    }
 }

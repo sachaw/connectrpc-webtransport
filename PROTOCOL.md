@@ -28,6 +28,13 @@ content-type: application/proto
 The server may stop reading the request stream (`STOP_SENDING`) once it has what it needs.
 A client must treat that as "read the response", not as a failure.
 
+## Abandoning a call
+
+A call is complete once its response has ended.
+A side that gives up on a call before then resets its send side (unless already finished) and stops its receive side, both with the call's Connect code as the WebTransport stream error code: 1 (`canceled`) or 4 (`deadline_exceeded`), mapped into HTTP/3's error space as draft-ietf-webtrans-http3 §4.4 specifies.
+A server ends the call as soon as its response side is stopped, whether or not it has anything left to write.
+Closing the session ends every call on it.
+
 ## Trailers
 
 Not used: Connect carries the unary status in the head and the streaming status in the end-of-stream envelope.

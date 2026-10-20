@@ -24,7 +24,7 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt", "macros", "io-util"] }
 tokio-util = "0.7"
 tracing = "0.1"
-wtransport = "0.7"
+wtransport = { version = "0.7", features = ["quinn"] }
 connectrpc = { version = "0.9", default-features = false, optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
 tower = { version = "0.5", features = ["util"], optional = true }
