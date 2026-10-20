@@ -33,6 +33,7 @@ A client must treat that as "read the response", not as a failure.
 A call is complete once its response has ended.
 A side that gives up on a call before then resets its send side (unless already finished) and stops its receive side, both with the call's Connect code as the WebTransport stream error code: 1 (`canceled`) or 4 (`deadline_exceeded`), mapped into HTTP/3's error space as draft-ietf-webtrans-http3 §4.4 specifies.
 A server ends the call as soon as its response side is stopped, whether or not it has anything left to write.
+A proxy abandoning a call it forwarded because its own caller abandoned it uses that caller's code.
 Closing the session ends every call on it.
 
 ## Trailers

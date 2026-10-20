@@ -146,35 +146,47 @@ where
     // A peer that abandons the call stops our send side; that ends the call at once, not at our
     // next write, which for an idle stream may never come.
     let stopped = send.quic_stream().stopped();
-    let serving = http1::Builder::new()
-        .timer(TokioTimer::new())
-        .header_read_timeout(header_timeout)
-        .keep_alive(false)
-        .half_close(true)
-        .serve_connection(
-            stream::io(send, recv),
-            service_fn(move |request: http::Request<Incoming>| {
-                let (service, connection) = (service.clone(), connection.clone());
-                let span = tracing::debug_span!("call", path = %request.uri().path());
-                async move {
-                    let mut request = request.map(|b| b.map_err(io::Error::other).boxed());
-                    request.extensions_mut().insert(connection);
-                    let response = service
-                        .oneshot(request)
-                        .await
-                        .unwrap_or_else(|e| match e {});
-                    tracing::debug!(status = response.status().as_u16(), "responded");
-                    Ok::<_, Infallible>(
-                        response.map(|b| b.map_err(|e| io::Error::other(e.to_string()))),
-                    )
-                }
-                .instrument(span)
-            }),
-        );
+    let abandonment = crate::Abandonment::default();
+    let mut serving = Box::pin(
+        http1::Builder::new()
+            .timer(TokioTimer::new())
+            .header_read_timeout(header_timeout)
+            .keep_alive(false)
+            .half_close(true)
+            .serve_connection(
+                stream::io(send, recv, None),
+                service_fn({
+                    let abandonment = abandonment.clone();
+                    move |request: http::Request<Incoming>| {
+                        let (service, connection, abandonment) =
+                            (service.clone(), connection.clone(), abandonment.clone());
+                        let span = tracing::debug_span!("call", path = %request.uri().path());
+                        async move {
+                            let mut request = request.map(|b| b.map_err(io::Error::other).boxed());
+                            request.extensions_mut().insert(connection);
+                            request.extensions_mut().insert(abandonment);
+                            let response = service
+                                .oneshot(request)
+                                .await
+                                .unwrap_or_else(|e| match e {});
+                            tracing::debug!(status = response.status().as_u16(), "responded");
+                            Ok::<_, Infallible>(
+                                response.map(|b| b.map_err(|e| io::Error::other(e.to_string()))),
+                            )
+                        }
+                        .instrument(span)
+                    }
+                }),
+            ),
+    );
     tokio::select! {
-        served = serving => served,
+        served = &mut serving => served,
         Ok(Some(code)) = stopped => {
-            tracing::debug!(code = ?stream::webtransport_code(code.into_inner()), "abandoned by the peer");
+            let code = stream::webtransport_code(code.into_inner());
+            tracing::debug!(?code, "abandoned by the peer");
+            // Said before the call is dropped, so what it forwarded is abandoned the same way.
+            abandonment.abandon(code.unwrap_or(crate::CANCELED));
+            drop(serving);
             Ok(())
         }
     }

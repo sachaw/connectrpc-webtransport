@@ -14,7 +14,7 @@ use tokio_util::sync::CancellationToken;
 use tower::service_fn;
 use wtransport::{ClientConfig, Endpoint, Identity, ServerConfig, VarInt};
 
-use connectrpc_webtransport::{Body, client, server};
+use connectrpc_webtransport::{Abandonment, Body, client, server};
 
 /// Counts the calls the server is holding.
 struct Held(Arc<AtomicUsize>);
@@ -29,6 +29,7 @@ struct Fixture {
     url: String,
     digest: wtransport::tls::Sha256Digest,
     held: Arc<AtomicUsize>,
+    last: Arc<std::sync::Mutex<Option<Abandonment>>>,
     cancel: CancellationToken,
 }
 
@@ -79,11 +80,13 @@ async fn start() -> Fixture {
         endpoint.local_addr().unwrap().port()
     );
     let held = Arc::new(AtomicUsize::new(0));
+    let last = Arc::new(std::sync::Mutex::new(None));
     let cancel = CancellationToken::new();
     let service = {
-        let held = held.clone();
+        let (held, last) = (held.clone(), last.clone());
         service_fn(move |req: http::Request<Body>| {
             held.fetch_add(1, Ordering::SeqCst);
+            *last.lock().unwrap() = req.extensions().get::<Abandonment>().cloned();
             let guard = Held(held.clone());
             async move {
                 if req.uri().path().ends_with("/Stall") {
@@ -106,6 +109,46 @@ async fn start() -> Fixture {
         url,
         digest,
         held,
+        last,
+        cancel,
+    }
+}
+
+/// Serves on a fresh endpoint, forwarding every call to `upstream` with its abandonment.
+async fn proxy(upstream: client::Transport) -> Fixture {
+    let identity = Identity::self_signed(["127.0.0.1"]).unwrap();
+    let digest = identity.certificate_chain().as_slice()[0].hash();
+    let endpoint = Endpoint::server(
+        ServerConfig::builder()
+            .with_bind_address("127.0.0.1:0".parse().unwrap())
+            .with_identity(identity)
+            .build(),
+    )
+    .unwrap();
+    let url = format!(
+        "https://127.0.0.1:{}/",
+        endpoint.local_addr().unwrap().port()
+    );
+    let cancel = CancellationToken::new();
+    let service = service_fn(move |req: http::Request<Body>| {
+        let upstream = upstream.clone();
+        async move {
+            let mut forwarded = watch(req.uri().path().rsplit('/').next().unwrap());
+            if let Some(a) = req.extensions().get::<Abandonment>() {
+                forwarded.extensions_mut().insert(a.clone());
+            }
+            Ok::<_, Infallible>(upstream.send(forwarded).await.unwrap())
+        }
+    });
+    let serving = cancel.clone();
+    tokio::spawn(async move {
+        server::serve(&endpoint, service, server::ServeOptions::default(), serving).await
+    });
+    Fixture {
+        url,
+        digest,
+        held: Arc::default(),
+        last: Arc::default(),
         cancel,
     }
 }
@@ -195,4 +238,30 @@ async fn closing_the_session_ends_its_calls() {
     assert_eq!(f.held.load(Ordering::SeqCst), 20);
     transport.close();
     f.none_held().await;
+}
+
+/// A proxy that forwards the abandonment passes the peer's own code upstream.
+#[tokio::test]
+async fn a_forwarded_call_is_abandoned_with_the_peers_code() {
+    let f = start().await;
+    let upstream = client::connect(&f.url, f.config()).await.unwrap();
+    let p = proxy(upstream).await;
+    let connection = Endpoint::client(p.config())
+        .unwrap()
+        .connect(&p.url)
+        .await
+        .unwrap();
+    let (mut send, mut recv) = connection.open_bi().await.unwrap().await.unwrap();
+    send.write_all(b"POST /test.v1.Test/Watch HTTP/1.1\r\ncontent-length: 0\r\n\r\n")
+        .await
+        .unwrap();
+    send.finish().await.unwrap();
+    let mut head = [0u8; 12];
+    recv.read_exact(&mut head).await.unwrap();
+    assert_eq!(f.held.load(Ordering::SeqCst), 1);
+    // Connect `deadline_exceeded` (4), in HTTP/3's error space.
+    recv.stop(VarInt::try_from_u64(0x52e4_a40f_a8db + 4).unwrap());
+    f.none_held().await;
+    let at_upstream = f.last.lock().unwrap().clone().unwrap();
+    assert_eq!(at_upstream.code(), Some(4));
 }

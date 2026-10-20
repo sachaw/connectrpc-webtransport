@@ -8,23 +8,30 @@ use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use wtransport::{RecvStream, SendStream, VarInt};
 
-pub(crate) fn io(send: SendStream, recv: RecvStream) -> TokioIo<Stream> {
+pub(crate) fn io(
+    send: SendStream,
+    recv: RecvStream,
+    abandonment: Option<crate::Abandonment>,
+) -> TokioIo<Stream> {
     TokioIo::new(Stream {
         send,
         recv,
         finished: false,
         ended: false,
+        abandonment,
     })
 }
 
 /// Completed means our side was finished or the peer's side was read to its end.
 /// Dropped otherwise, the call was abandoned: the send side is reset and the receive side stopped,
-/// rather than the FIN that would make a truncated exchange look whole.
+/// rather than the FIN that would make a truncated exchange look whole. The code is the
+/// [`Abandonment`](crate::Abandonment)'s when it has one.
 pub(crate) struct Stream {
     send: SendStream,
     recv: RecvStream,
     finished: bool,
     ended: bool,
+    abandonment: Option<crate::Abandonment>,
 }
 
 impl Drop for Stream {
@@ -32,7 +39,12 @@ impl Drop for Stream {
         if self.finished || self.ended {
             return;
         }
-        let code = http3_code(crate::CANCELED);
+        let code = http3_code(
+            self.abandonment
+                .as_ref()
+                .and_then(crate::Abandonment::code)
+                .unwrap_or(crate::CANCELED),
+        );
         let _ = self.send.reset(code);
         let _ = self
             .recv

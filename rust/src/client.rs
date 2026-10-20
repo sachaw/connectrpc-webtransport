@@ -189,7 +189,8 @@ async fn call(
     if let Some(priority) = priority {
         send.set_priority(priority);
     }
-    let (mut sender, conn) = http1::handshake(stream::io(send, recv)).await?;
+    let abandonment = request.extensions().get::<crate::Abandonment>().cloned();
+    let (mut sender, conn) = http1::handshake(stream::io(send, recv, abandonment)).await?;
     // Owned by the call: dropped before its response ends, the exchange is abandoned on the wire.
     let call = Abandon(Some(
         tokio::spawn(async move {
