@@ -87,6 +87,7 @@ pub(crate) fn http3_code(code: u32) -> VarInt {
 }
 
 /// The WebTransport stream error code an HTTP/3 one carries, if it is one.
+#[cfg(any(feature = "server", test))]
 pub(crate) fn webtransport_code(h3: u64) -> Option<u32> {
     let shifted = h3.checked_sub(FIRST)?;
     if (h3 - 0x21).is_multiple_of(0x1f) {
