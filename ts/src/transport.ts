@@ -443,10 +443,24 @@ async function open(
 // error code (1 canceled, 4 deadline_exceeded), where the runtime has WebTransportError.
 function streamError(reason: unknown): unknown {
   if (typeof WebTransportError !== "function") return reason;
-  const error = ConnectError.from(reason, Code.Canceled);
-  return new WebTransportError(error.rawMessage, {
-    streamErrorCode: error.code,
-  });
+  const { rawMessage: message, code: streamErrorCode } = ConnectError.from(
+    reason,
+    Code.Canceled,
+  );
+  try {
+    return new WebTransportError(message, { streamErrorCode });
+  } catch {
+    // Chromium still takes only the pre-#425 form, one init dictionary
+    // (w3c/webtransport#715). Remove this fallback once Chromium takes
+    // (message, options).
+    try {
+      return new (WebTransportError as unknown as new (
+        init: { message: string; streamErrorCode: number },
+      ) => WebTransportError)({ message, streamErrorCode });
+    } catch {
+      return reason;
+    }
+  }
 }
 
 function fixed(

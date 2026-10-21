@@ -380,7 +380,7 @@ function streamErrorCode(reason: unknown): number | null {
   return reason.streamErrorCode;
 }
 
-Deno.test("an abandoned call resets and stops its stream with the call's Connect code", async () => {
+async function abandonEachKind(): Promise<void> {
   const hanging = createWebTransportServer({
     routes: (router) =>
       router.service(EchoService, {
@@ -434,6 +434,41 @@ Deno.test("an abandoned call resets and stops its stream with the call's Connect
     streamErrorCode(abandoned[2].stopped),
     Code.DeadlineExceeded,
   );
+}
+
+Deno.test(
+  "an abandoned call resets and stops its stream with the call's Connect code",
+  abandonEachKind,
+);
+
+// Chromium takes only the pre-#425 constructor, one init dictionary, and throws
+// on (message, options): the same codes still reach the server.
+Deno.test("the stream error code survives a runtime with the init-dictionary constructor", async () => {
+  const spec = globalThis.WebTransportError;
+  class InitOnly extends Error {
+    readonly streamErrorCode: number | null;
+    readonly source = "stream";
+    constructor(init?: unknown) {
+      if (init !== undefined && (typeof init !== "object" || init === null)) {
+        throw new TypeError(
+          "Failed to construct 'WebTransportError': The provided value is not of type 'WebTransportErrorInit'.",
+        );
+      }
+      const { message = "", streamErrorCode = null } = (init ?? {}) as {
+        message?: string;
+        streamErrorCode?: number | null;
+      };
+      super(message);
+      this.streamErrorCode = streamErrorCode;
+    }
+  }
+  globalThis.WebTransportError =
+    InitOnly as unknown as typeof WebTransportError;
+  try {
+    await abandonEachKind();
+  } finally {
+    globalThis.WebTransportError = spec;
+  }
 });
 
 Deno.test("a completed call is not abandoned by a later abort", async () => {
