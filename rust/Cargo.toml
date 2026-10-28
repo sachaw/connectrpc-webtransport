@@ -12,6 +12,8 @@ categories = ["network-programming", "web-programming", "asynchronous"]
 default = ["server", "client"]
 server = ["dep:tower", "hyper/server", "tokio/time"]
 client = ["dep:connectrpc", "dep:futures-util", "hyper/client", "tokio/time"]
+# QUIC's TLS on aws-lc-rs's FIPS module rather than its default build.
+fips = ["wtransport/fips"]
 
 [dependencies]
 bytes = "1"
@@ -24,14 +26,17 @@ thiserror = "2"
 tokio = { version = "1", features = ["rt", "macros", "io-util"] }
 tokio-util = "0.7"
 tracing = "0.1"
-wtransport = { version = "0.7", features = ["quinn"] }
+# aws-lc-rs is QUIC's one crypto provider: wtransport's defaults would add ring
+# beside it, and ring has no ML-KEM.
+wtransport = { version = "0.7", default-features = false, features = ["quinn", "aws-lc-rs"] }
 connectrpc = { version = "0.9", default-features = false, optional = true }
 futures-util = { version = "0.3", default-features = false, features = ["std"], optional = true }
 tower = { version = "0.5", features = ["util"], optional = true }
 
 [dev-dependencies]
 futures-util = { version = "0.3", default-features = false }
-rcgen = { version = "0.14", default-features = false, features = ["ring"] }
+rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs"] }
+wtransport = { version = "0.7", default-features = false, features = ["quinn", "aws-lc-rs", "self-signed"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "sync", "process"] }
 
 [package.metadata.docs.rs]

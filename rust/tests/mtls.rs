@@ -54,7 +54,7 @@ async fn whoami(req: http::Request<Body>) -> Result<http::Response<Body>, Infall
 
 #[tokio::test]
 async fn client_certificate_is_the_peer_identity() {
-    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
     let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     let ca = CertifiedIssuer::self_signed(ca_params, KeyPair::generate().unwrap()).unwrap();
