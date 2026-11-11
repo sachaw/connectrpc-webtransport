@@ -153,6 +153,9 @@ where
             .header_read_timeout(header_timeout)
             .keep_alive(false)
             .half_close(true)
+            // Each body chunk queued as it is, not copied into one buffer that keeps its largest size for the
+            // stream's life.
+            .writev(true)
             .serve_connection(
                 stream::io(send, recv, None),
                 service_fn({
