@@ -28,6 +28,7 @@
       "src/server.ts",
       "src/http1.ts",
       "src/compression.ts",
+      "src/envelope.ts",
       "README.md",
       "deno.json"
     ]

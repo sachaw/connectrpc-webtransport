@@ -20,7 +20,6 @@ import {
   transformJoinEnvelopes,
   transformParseEnvelope,
   transformSerializeEnvelope,
-  transformSplitEnvelope,
 } from "@connectrpc/connect/protocol";
 import {
   createEndStreamSerialization,
@@ -38,6 +37,7 @@ import {
   Http1Reader,
   LAST_CHUNK,
 } from "./http1.ts";
+import { splitEnvelopes } from "./envelope.ts";
 import type {
   BinaryReadOptions,
   BinaryWriteOptions,
@@ -271,7 +271,7 @@ export function createWebTransportTransport(
           const trailer = new Headers();
           const message = pipe(
             res.body,
-            transformSplitEnvelope(limits.readMaxBytes),
+            splitEnvelopes(limits.readMaxBytes),
             transformDecompressEnvelope(
               compression ?? null,
               limits.readMaxBytes,
